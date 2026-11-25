@@ -1,0 +1,141 @@
+services:
+  kafka-1:
+    image: confluentinc/cp-kafka:7.7.1
+    hostname: kafka-1
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    hostname: schema-registry
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-1:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/subjects >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.1
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka-1:9092
+      KAFKA_TOPIC: movie-events
+      KAFKA_PARTITIONS: 3
+      KAFKA_REPLICATION_FACTOR: 1
+    volumes:
+      - ./init/kafka_init.sh:/init/kafka_init.sh:ro
+    entrypoint: ["bash", "/init/kafka_init.sh"]
+
+  schema-init:
+    image: python:3.13-slim
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SCHEMA_SUBJECT: movie-events-value
+      SCHEMA_PATH: /schemas/movie_event.avsc
+    volumes:
+      - ./init/register_schema.py:/init/register_schema.py:ro
+      - ./schemas:/schemas:ro
+    command: ["python", "/init/register_schema.py"]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    hostname: clickhouse
+    depends_on:
+      schema-init:
+        condition: service_completed_successfully
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ./init/clickhouse_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  producer:
+    build:
+      context: ./producer
+      network: host
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka-1:9092
+      KAFKA_TOPIC: movie-events
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SCHEMA_PATH: /schemas/movie_event.avsc
+      GENERATOR_ENABLED: "true"
+      GENERATOR_INTERVAL_SECONDS: "5"
+    volumes:
+      - ./schemas:/schemas:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: ./tests
+      network: host
+    depends_on:
+      producer:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      PRODUCER_URL: http://producer:8000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: analytics
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+
+volumes:
+  clickhouse_data:

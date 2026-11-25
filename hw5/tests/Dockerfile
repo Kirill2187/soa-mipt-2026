@@ -1,0 +1,10 @@
+FROM python:3.13-slim
+
+WORKDIR /tests
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY test_pipeline.py .
+
+CMD ["pytest", "-v", "test_pipeline.py"]
