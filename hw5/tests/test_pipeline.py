@@ -1,5 +1,3 @@
-"""Integration tests for the Online Cinema pipeline (Producer -> Kafka -> ClickHouse)."""
-
 from __future__ import annotations
 
 import json
@@ -8,31 +6,36 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import boto3
 import httpx
-import pytest
+import psycopg
 
 PRODUCER_URL = os.getenv("PRODUCER_URL", "http://localhost:8000").rstrip("/")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://localhost:8001").rstrip("/")
 CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL", "http://localhost:8123").rstrip("/")
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "analytics")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "analytics")
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:8081").rstrip("/")
+POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://analytics:analytics@localhost:5432/analytics")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://localhost:9005")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
+S3_BUCKET = os.getenv("S3_BUCKET", "movie-analytics")
+GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:3000").rstrip("/")
 
 
 def ch_query(sql: str) -> list[dict]:
-    """Execute a SELECT in ClickHouse over HTTP and return parsed JSONEachRow rows."""
     resp = httpx.post(
         CLICKHOUSE_URL,
         params={"user": CLICKHOUSE_USER, "password": CLICKHOUSE_PASSWORD},
         content=f"{sql} FORMAT JSONEachRow".encode("utf-8"),
-        timeout=10.0,
+        timeout=15.0,
     )
     resp.raise_for_status()
-    lines = [line for line in resp.text.strip().splitlines() if line]
-    return [json.loads(line) for line in lines]
+    return [json.loads(line) for line in resp.text.strip().splitlines() if line]
 
 
 def ch_exec(sql: str) -> None:
-    """Execute a DDL/DML statement in ClickHouse over HTTP."""
     resp = httpx.post(
         CLICKHOUSE_URL,
         params={"user": CLICKHOUSE_USER, "password": CLICKHOUSE_PASSWORD},
@@ -54,14 +57,12 @@ def wait_for_rows(sql: str, expected_count: int = 1, timeout: float = 20.0) -> l
 
 
 def test_schema_registered_in_schema_registry() -> None:
-    """Step 1: Verify Avro schema is registered in Schema Registry with version >= 1."""
     resp = httpx.get(f"{SCHEMA_REGISTRY_URL}/subjects/movie-events-value/versions/latest", timeout=5.0)
     assert resp.status_code == 200
     data = resp.json()
     assert data["version"] >= 1
     schema = json.loads(data["schema"])
-    field_names = {f["name"] for f in schema["fields"]}
-    assert field_names == {
+    assert {f["name"] for f in schema["fields"]} == {
         "event_id",
         "user_id",
         "movie_id",
@@ -74,7 +75,6 @@ def test_schema_registered_in_schema_registry() -> None:
 
 
 def test_producer_rejects_invalid_event() -> None:
-    """Step 2: Producer HTTP API validates incoming JSON and rejects invalid enum/fields."""
     bad_payload = {
         "user_id": "test-invalid",
         "movie_id": "movie_1",
@@ -88,7 +88,6 @@ def test_producer_rejects_invalid_event() -> None:
 
 
 def test_event_flows_from_producer_through_kafka_to_clickhouse() -> None:
-    """Step 4: Publish an event via Producer HTTP API and verify all 8 fields in ClickHouse."""
     event_id = str(uuid4())
     user_id = f"test-user-{uuid4().hex[:10]}"
     session_id = f"test-sess-{uuid4().hex[:8]}"
@@ -121,8 +120,7 @@ def test_event_flows_from_producer_through_kafka_to_clickhouse() -> None:
             expected_count=1,
             timeout=20.0,
         )
-        assert len(rows) == 1, f"Event {event_id} did not arrive in ClickHouse"
-
+        assert len(rows) == 1
         row = rows[0]
         assert row["event_id"] == event_id
         assert row["user_id"] == user_id
@@ -133,7 +131,6 @@ def test_event_flows_from_producer_through_kafka_to_clickhouse() -> None:
         assert row["session_id"] == session_id
         assert int(row["progress_seconds"]) == 5432
     finally:
-        # Keep the database clean so the test can be repeated indefinitely
         ch_exec(
             f"ALTER TABLE analytics.movie_events_raw "
             f"DELETE WHERE user_id = '{user_id}' SETTINGS mutations_sync = 1"
@@ -141,35 +138,24 @@ def test_event_flows_from_producer_through_kafka_to_clickhouse() -> None:
 
 
 def test_realistic_session_generator_ordering() -> None:
-    """Step 2 & 4: Generated session events arrive in ClickHouse with realistic ordering."""
     user_id = f"test-gen-{uuid4().hex[:10]}"
     try:
-        resp = httpx.post(
-            f"{PRODUCER_URL}/generate",
-            params={"sessions": 1, "user_id": user_id},
-            timeout=20.0,
-        )
+        resp = httpx.post(f"{PRODUCER_URL}/generate", params={"sessions": 1, "user_id": user_id}, timeout=20.0)
         assert resp.status_code == 200, resp.text
-        body = resp.json()
-        expected_n = body["events_published"]
-        assert expected_n >= 1
+        expected_n = resp.json()["events_published"]
 
         rows = wait_for_rows(
-            f"SELECT event_type, progress_seconds, toUnixTimestamp64Milli(timestamp) AS ts_ms "
+            f"SELECT event_type, progress_seconds "
             f"FROM analytics.movie_events_raw "
-            f"WHERE user_id = '{user_id}' "
-            f"ORDER BY timestamp ASC",
+            f"WHERE user_id = '{user_id}' ORDER BY timestamp ASC",
             expected_count=expected_n,
             timeout=20.0,
         )
         assert len(rows) == expected_n
-
         types = [r["event_type"] for r in rows]
         assert "VIEW_STARTED" in types
         if "VIEW_FINISHED" in types:
             assert types.index("VIEW_STARTED") < types.index("VIEW_FINISHED")
-
-        # Progress should be non-decreasing across playback events
         progresses = [int(r["progress_seconds"]) for r in rows]
         assert progresses == sorted(progresses)
     finally:
@@ -177,3 +163,114 @@ def test_realistic_session_generator_ordering() -> None:
             f"ALTER TABLE analytics.movie_events_raw "
             f"DELETE WHERE user_id = '{user_id}' SETTINGS mutations_sync = 1"
         )
+
+
+def test_aggregation_and_postgres_idempotency() -> None:
+    today = datetime.now(timezone.utc).date().isoformat()
+    wait_for_rows(
+        f"SELECT 1 FROM analytics.movie_events_raw WHERE toDate(timestamp) = toDate('{today}') AND event_type = 'VIEW_STARTED' LIMIT 1",
+        expected_count=1,
+        timeout=20.0,
+    )
+
+    r1 = httpx.post(f"{AGGREGATOR_URL}/aggregate", params={"date": today}, timeout=30.0)
+    assert r1.status_code == 200, r1.text
+    r2 = httpx.post(f"{AGGREGATOR_URL}/aggregate", params={"date": today}, timeout=30.0)
+    assert r2.status_code == 200, r2.text
+
+    expected_metrics = {"dau", "avg_watch_seconds", "view_conversion", "retention_d1", "retention_d7"}
+    assert set(r2.json()["metrics"].keys()) == expected_metrics
+
+    with psycopg.connect(POSTGRES_DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT metric_name, metric_value, computed_at FROM daily_metrics WHERE metric_date = %s",
+                (today,),
+            )
+            pg_rows = cur.fetchall()
+            cur.execute(
+                "SELECT movie_id, views_count, rank FROM daily_top_movies WHERE metric_date = %s",
+                (today,),
+            )
+            top_rows = cur.fetchall()
+
+    assert len(pg_rows) == 5
+    assert {r[0] for r in pg_rows} == expected_metrics
+    assert all(r[2] is not None for r in pg_rows)
+    assert len(top_rows) >= 1
+
+    ch_daily = ch_query(f"SELECT dau FROM analytics.daily_metrics FINAL WHERE metric_date = toDate('{today}')")
+    ch_cohorts = ch_query("SELECT count() AS cnt FROM analytics.retention_cohorts FINAL")
+    assert len(ch_daily) == 1
+    assert int(ch_cohorts[0]["cnt"]) >= 1
+
+
+def test_s3_export_and_overwrite() -> None:
+    today = datetime.now(timezone.utc).date().isoformat()
+    key = f"daily/{today}/aggregates.json"
+
+    r1 = httpx.post(f"{AGGREGATOR_URL}/export", params={"date": today}, timeout=30.0)
+    assert r1.status_code == 200, r1.text
+    r2 = httpx.post(f"{AGGREGATOR_URL}/export", params={"date": today}, timeout=30.0)
+    assert r2.status_code == 200, r2.text
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name="us-east-1",
+    )
+    listed = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"daily/{today}/")
+    assert [obj["Key"] for obj in listed.get("Contents", [])] == [key]
+
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+    assert data["date"] == today
+    assert "computed_at" in data
+    assert {"dau", "avg_watch_seconds", "view_conversion", "retention_d1", "retention_d7"} <= set(
+        data["metrics"].keys()
+    )
+
+
+def test_grafana_clickhouse_datasource_and_dashboard() -> None:
+    auth = ("admin", "admin")
+
+    ds_resp = httpx.get(f"{GRAFANA_URL}/api/datasources", auth=auth, timeout=10.0)
+    assert ds_resp.status_code == 200
+    assert any(
+        ds["uid"] == "clickhouse" and ds["type"] == "grafana-clickhouse-datasource"
+        for ds in ds_resp.json()
+    )
+
+    dash_resp = httpx.get(f"{GRAFANA_URL}/api/dashboards/uid/online-cinema-analytics", auth=auth, timeout=10.0)
+    assert dash_resp.status_code == 200
+    panels = dash_resp.json()["dashboard"]["panels"]
+    assert any("Retention Cohort Heatmap" in p["title"] for p in panels)
+    assert len(panels) >= 3
+
+    query_resp = httpx.post(
+        f"{GRAFANA_URL}/api/ds/query",
+        auth=auth,
+        json={
+            "queries": [
+                {
+                    "refId": "A",
+                    "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse"},
+                    "editorType": "sql",
+                    "format": 1,
+                    "queryType": "table",
+                    "rawSql": (
+                        "SELECT toString(cohort_date) AS cohort, "
+                        "maxIf(retention_pct, day_num = 0) AS day_0 "
+                        "FROM analytics.retention_cohorts FINAL "
+                        "GROUP BY cohort_date ORDER BY cohort_date DESC"
+                    ),
+                }
+            ]
+        },
+        timeout=15.0,
+    )
+    assert query_resp.status_code == 200, query_resp.text
+    frame = query_resp.json()["results"]["A"]["frames"][0]
+    assert len(frame["data"]["values"][0]) >= 1

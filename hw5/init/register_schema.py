@@ -1,10 +1,7 @@
-"""Register the Avro event schema in Confluent Schema Registry on startup."""
-
 import json
 import os
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -22,12 +19,11 @@ def wait_for_registry(timeout_seconds: int = 60) -> None:
                     return
         except Exception:
             time.sleep(1)
-    raise RuntimeError(f"Schema Registry at {SCHEMA_REGISTRY_URL} did not become ready in time")
+    raise RuntimeError(f"Schema Registry at {SCHEMA_REGISTRY_URL} is not ready")
 
 
 def register_schema() -> None:
     schema_text = SCHEMA_PATH.read_text(encoding="utf-8")
-    # Validate JSON locally before sending
     json.loads(schema_text)
 
     payload = json.dumps({"schemaType": "AVRO", "schema": schema_text}).encode("utf-8")
@@ -43,10 +39,7 @@ def register_schema() -> None:
     with urllib.request.urlopen(f"{SCHEMA_REGISTRY_URL}/subjects/{SUBJECT}/versions/latest", timeout=10) as resp:
         latest = json.loads(resp.read().decode("utf-8"))
 
-    print(
-        f"Registered subject='{SUBJECT}' schema_id={reg['id']} version={latest['version']}",
-        flush=True,
-    )
+    print(f"Registered subject='{SUBJECT}' schema_id={reg['id']} version={latest['version']}", flush=True)
 
 
 if __name__ == "__main__":

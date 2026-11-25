@@ -1,0 +1,130 @@
+{
+  "uid": "online-cinema-analytics",
+  "title": "Online Cinema Analytics",
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-14d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Retention Cohort Heatmap (%)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "align": "center",
+            "cellOptions": { "type": "color-background", "mode": "gradient" }
+          },
+          "color": { "mode": "continuous-GrYlRd" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Cohort" },
+            "properties": [
+              { "id": "unit", "value": "none" },
+              { "id": "custom.cellOptions", "value": { "type": "auto" } }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toString(cohort_date) AS \"Cohort\", maxIf(retention_pct, day_num = 0) AS \"Day 0\", maxIf(retention_pct, day_num = 1) AS \"Day 1\", maxIf(retention_pct, day_num = 2) AS \"Day 2\", maxIf(retention_pct, day_num = 3) AS \"Day 3\", maxIf(retention_pct, day_num = 4) AS \"Day 4\", maxIf(retention_pct, day_num = 5) AS \"Day 5\", maxIf(retention_pct, day_num = 6) AS \"Day 6\", maxIf(retention_pct, day_num = 7) AS \"Day 7\" FROM analytics.retention_cohorts FINAL GROUP BY cohort_date ORDER BY cohort_date DESC"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "barchart",
+      "title": "DAU",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toString(metric_date) AS date, dau AS DAU FROM analytics.daily_metrics FINAL ORDER BY metric_date ASC"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "barchart",
+      "title": "View Conversion (%)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toString(metric_date) AS date, round(view_conversion * 100, 1) AS \"Conversion %\" FROM analytics.daily_metrics FINAL ORDER BY metric_date ASC"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Top Movies",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT movie_id AS \"Movie\", sum(views_count) AS \"Views\", sum(finished_count) AS \"Finished\", round(avg(avg_watch_seconds), 0) AS \"Avg Watch (s)\" FROM analytics.daily_top_movies FINAL GROUP BY movie_id ORDER BY sum(views_count) DESC LIMIT 10"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "barchart",
+      "title": "Avg Watch Time (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT toString(metric_date) AS date, round(avg_watch_seconds, 0) AS \"Avg Watch Time\" FROM analytics.daily_metrics FINAL ORDER BY metric_date ASC"
+        }
+      ]
+    }
+  ]
+}

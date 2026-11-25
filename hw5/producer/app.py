@@ -1,5 +1,3 @@
-"""Movie Service (Producer): HTTP API + synthetic realistic session generator."""
-
 from __future__ import annotations
 
 import asyncio
@@ -27,8 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("producer")
 
-# --- Configuration ---
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka-1:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka-1:9092,kafka-2:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "movie-events")
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 SCHEMA_PATH = Path(os.getenv("SCHEMA_PATH", "/schemas/movie_event.avsc"))
@@ -38,6 +35,7 @@ BASE_BACKOFF_SECONDS = float(os.getenv("BASE_BACKOFF_SECONDS", "0.5"))
 
 GENERATOR_ENABLED = os.getenv("GENERATOR_ENABLED", "true").lower() == "true"
 GENERATOR_INTERVAL_SECONDS = float(os.getenv("GENERATOR_INTERVAL_SECONDS", "5.0"))
+SEED_HISTORY_DAYS = int(os.getenv("SEED_HISTORY_DAYS", "8"))
 
 SAMPLE_MOVIES = [
     "movie_interstellar",
@@ -52,7 +50,6 @@ SAMPLE_MOVIES = [
 SAMPLE_USERS = [f"user_{i:03d}" for i in range(1, 51)]
 
 
-# --- Pydantic Event Schema (matches schemas/movie_event.avsc) ---
 class EventType(str, Enum):
     VIEW_STARTED = "VIEW_STARTED"
     VIEW_FINISHED = "VIEW_FINISHED"
@@ -81,10 +78,7 @@ class MovieEvent(BaseModel):
 
     def to_avro_dict(self) -> dict[str, Any]:
         ts = self.timestamp
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        else:
-            ts = ts.astimezone(timezone.utc)
+        ts = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
         return {
             "event_id": str(self.event_id),
             "user_id": self.user_id,
@@ -97,19 +91,15 @@ class MovieEvent(BaseModel):
         }
 
 
-# --- Kafka + Schema Registry Producer ---
 class KafkaEventPublisher:
     def __init__(self) -> None:
         schema_str = SCHEMA_PATH.read_text(encoding="utf-8")
         self.schema_registry = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
-        # auto.register.schemas=True keeps startup resilient if Schema Registry restarted;
-        # the schema is already registered by schema-init as version 1.
         self.avro_serializer = AvroSerializer(
             self.schema_registry,
             schema_str,
             conf={"auto.register.schemas": True},
         )
-        # acks='all' waits for leader + all in-sync replicas before acknowledging.
         self.producer = Producer(
             {
                 "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
@@ -120,14 +110,10 @@ class KafkaEventPublisher:
         )
 
     def publish(self, event: MovieEvent) -> dict[str, Any]:
-        # 1. Validate and encode against the Avro schema from Schema Registry
         ctx = SerializationContext(KAFKA_TOPIC, MessageField.VALUE)
         payload = self.avro_serializer(event.to_avro_dict(), ctx)
-
-        # Partition key = user_id -> guarantees strict event order per user session
         key = event.user_id.encode("utf-8")
 
-        # 2. Publish with explicit exponential backoff retries
         last_error: str | None = None
         for attempt in range(1, MAX_PUBLISH_RETRIES + 1):
             delivery_error: Any = None
@@ -141,12 +127,7 @@ class KafkaEventPublisher:
                     delivery_meta = {"partition": msg.partition(), "offset": msg.offset()}
 
             try:
-                self.producer.produce(
-                    topic=KAFKA_TOPIC,
-                    key=key,
-                    value=payload,
-                    on_delivery=on_delivery,
-                )
+                self.producer.produce(topic=KAFKA_TOPIC, key=key, value=payload, on_delivery=on_delivery)
                 remaining = self.producer.flush(timeout=10.0)
                 if remaining == 0 and delivery_error is None:
                     logger.info(
@@ -166,7 +147,7 @@ class KafkaEventPublisher:
             if attempt < MAX_PUBLISH_RETRIES:
                 delay = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 logger.warning(
-                    "Publish failed for event_id=%s (attempt %d/%d): %s. Retrying in %.2fs...",
+                    "Publish failed for event_id=%s (attempt %d/%d): %s; retrying in %.2fs",
                     event.event_id,
                     attempt,
                     MAX_PUBLISH_RETRIES,
@@ -179,22 +160,18 @@ class KafkaEventPublisher:
         raise RuntimeError(f"Kafka publish failed: {last_error}")
 
 
-# --- Realistic Synthetic Session Generator ---
 def build_realistic_session(
     user_id: str | None = None,
     movie_id: str | None = None,
     base_time: datetime | None = None,
 ) -> list[MovieEvent]:
-    """Generate a realistic viewing session with strictly increasing timestamps and progress."""
     uid = user_id or random.choice(SAMPLE_USERS)
     mid = movie_id or random.choice(SAMPLE_MOVIES)
     device = random.choice(list(DeviceType))
     session_id = f"sess-{uuid4().hex[:12]}"
     t = base_time or datetime.now(timezone.utc)
-
     events: list[MovieEvent] = []
 
-    # Optional search before starting playback
     if random.random() < 0.5:
         events.append(
             MovieEvent(
@@ -209,7 +186,6 @@ def build_realistic_session(
         )
         t += timedelta(seconds=random.randint(5, 30))
 
-    # VIEW_STARTED always precedes pauses/resumes/finish
     events.append(
         MovieEvent(
             user_id=uid,
@@ -223,7 +199,6 @@ def build_realistic_session(
     )
 
     progress = 0
-    # 0 to 2 pause/resume cycles with monotonically growing progress_seconds
     for _ in range(random.randint(0, 2)):
         watched = random.randint(180, 900)
         progress += watched
@@ -252,7 +227,6 @@ def build_realistic_session(
             )
         )
 
-    # ~70% of sessions finish the movie
     if random.random() < 0.7:
         remaining = random.randint(300, 1800)
         progress += remaining
@@ -289,12 +263,37 @@ publisher: KafkaEventPublisher | None = None
 _generator_task: asyncio.Task[None] | None = None
 
 
+def seed_multi_day_cohorts(days: int = 8, users_per_day: int = 8) -> int:
+    assert publisher is not None
+    today = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+    published = 0
+    for cohort_offset in range(days):
+        cohort_day = today - timedelta(days=cohort_offset)
+        for u_idx in range(users_per_day):
+            uid = f"cohort_{cohort_day.strftime('%Y%m%d')}_u{u_idx:02d}"
+            for ev in build_realistic_session(user_id=uid, base_time=cohort_day + timedelta(minutes=u_idx * 5)):
+                publisher.publish(ev)
+                published += 1
+            for follow in range(1, cohort_offset + 1):
+                if random.random() < max(0.15, 0.65 - 0.07 * follow):
+                    ts = cohort_day + timedelta(days=follow, minutes=random.randint(10, 300))
+                    for ev in build_realistic_session(user_id=uid, base_time=ts):
+                        publisher.publish(ev)
+                        published += 1
+    logger.info("Seeded %d historical cohort events across %d days", published, days)
+    return published
+
+
 async def _background_generator() -> None:
-    logger.info("Background event generator started (interval=%.1fs)", GENERATOR_INTERVAL_SECONDS)
+    if SEED_HISTORY_DAYS > 0:
+        try:
+            await asyncio.to_thread(seed_multi_day_cohorts, SEED_HISTORY_DAYS, 8)
+        except Exception as exc:
+            logger.error("Initial cohort seed failed: %s", exc)
+    logger.info("Background generator started (interval=%.1fs)", GENERATOR_INTERVAL_SECONDS)
     while True:
         try:
-            session_events = build_realistic_session()
-            for ev in session_events:
+            for ev in build_realistic_session():
                 assert publisher is not None
                 await asyncio.to_thread(publisher.publish, ev)
         except asyncio.CancelledError:
@@ -319,7 +318,7 @@ async def lifespan(_app: FastAPI):
             pass
 
 
-app = FastAPI(title="Online Cinema Movie Service (Producer)", lifespan=lifespan)
+app = FastAPI(title="Movie Service (Producer)", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -329,17 +328,12 @@ def health() -> dict[str, str]:
 
 @app.post("/events")
 def ingest_event(event: MovieEvent) -> dict[str, Any]:
-    """Validate an incoming JSON event and publish it to Kafka."""
     assert publisher is not None
     try:
         meta = publisher.publish(event)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {
-        "event_id": str(event.event_id),
-        "partition": meta["partition"],
-        "offset": meta["offset"],
-    }
+    return {"event_id": str(event.event_id), "partition": meta["partition"], "offset": meta["offset"]}
 
 
 @app.post("/generate")
@@ -347,7 +341,6 @@ def generate_sessions(
     sessions: int = Query(default=1, ge=1, le=200),
     user_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Generate N realistic user sessions on demand and publish them to Kafka."""
     assert publisher is not None
     event_ids: list[str] = []
     session_ids: list[str] = []
